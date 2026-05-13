@@ -1,0 +1,6 @@
+node_modules/
+.env
+.wwebjs_auth/
+.wwebjs_cache/
+google-credentials.json
+google-token.json
