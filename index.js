@@ -12,6 +12,8 @@ require('dotenv').config();
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
+const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen2.5:72b';
 const POLL_INTERVAL_MS = 30_000;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -19,8 +21,27 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   process.exit(1);
 }
 
+const nodemailer = require('nodemailer');
+
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const ai = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+
+const mailer = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: process.env.SMTP_USER || 'james.w.lowndes@gmail.com',
+    pass: process.env.SMTP_PASSWORD || '',
+  },
+});
+
+async function sendEmail(subject, text) {
+  const to = process.env.SMTP_TO || 'astrid.woloszczuk@outlook.com';
+  if (!process.env.SMTP_PASSWORD) { console.log('SMTP_PASSWORD not set — skipping email'); return; }
+  await mailer.sendMail({ from: process.env.SMTP_USER, to, subject, text });
+  console.log(`Email sent: ${subject}`);
+}
 
 // ── People cache (refreshed every 5 min) ────────────────────────────────────
 let _people = [];
@@ -358,6 +379,100 @@ async function handleCompletion(client, person, numbers) {
   console.log(`[${person.name}] Completed ${done.length} todo(s): ${done.map(t => t.text.slice(0,30)).join(', ')}`);
 }
 
+// ── Ollama / Qwen ────────────────────────────────────────────────────────────
+async function callQwen(messages) {
+  const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: QWEN_MODEL, messages, stream: false, options: { temperature: 0.7 } }),
+  });
+  if (!resp.ok) throw new Error(`Ollama ${resp.status}`);
+  const data = await resp.json();
+  return data.message.content;
+}
+
+// ── Conversation history ──────────────────────────────────────────────────────
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_HISTORY = 10;
+
+async function getConversationHistory(personId) {
+  const { data } = await supa
+    .from('conversations')
+    .select('role, content, created_at')
+    .eq('person_id', personId)
+    .order('created_at', { ascending: false })
+    .limit(MAX_HISTORY);
+  if (!data?.length) return [];
+  if (Date.now() - new Date(data[0].created_at).getTime() > SESSION_TIMEOUT_MS) return [];
+  return data.reverse();
+}
+
+async function saveConversation(personId, role, content) {
+  await supa.from('conversations').insert({ person_id: personId, role, content });
+}
+
+// ── General AI handler ────────────────────────────────────────────────────────
+const JAMES_SYSTEM = `You are James, a helpful home AI assistant for Astrid Woloszczuk and her family in Vienna, Austria.
+You help with research, recommendations, planning, and general questions.
+Family: Astrid (mum, COO), Niko (dad), Max (15), Alex (13), Vicky (11).
+Be concise and direct. For WhatsApp: keep replies under 400 words. For research tasks you will send a short summary via WhatsApp and email the full report.
+Today's date: ${new Date().toISOString().slice(0, 10)}.`;
+
+function detectModelOverride(text) {
+  if (/^(claude|research|anthropic)\s*:/i.test(text)) return { model: 'claude', text: text.replace(/^[^:]+:\s*/, '') };
+  if (/^(qwen|local|james)\s*:/i.test(text)) return { model: 'qwen', text: text.replace(/^[^:]+:\s*/, '') };
+  return { model: null, text };
+}
+
+function isResearchTask(text) {
+  return /\b(report|research|compare|options|recommend|hotels?|flights?|prices?|reviews?|restaurants?|itinerary|plan|analyse|analyze|find me|tell me about|what are the best)\b/i.test(text)
+    || text.split(/\s+/).length > 25;
+}
+
+async function handleGeneralAI(client, person, rawText) {
+  const { model: forceModel, text } = detectModelOverride(rawText);
+  const useModel = forceModel || (isResearchTask(text) ? 'claude' : 'qwen');
+
+  const history = await getConversationHistory(person.id);
+  await saveConversation(person.id, 'user', rawText);
+
+  const messages = [
+    ...history.map(h => ({ role: h.role, content: h.content })),
+    { role: 'user', content: text },
+  ];
+
+  let reply;
+  try {
+    if (useModel === 'claude' && ai) {
+      const response = await ai.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2000,
+        system: JAMES_SYSTEM,
+        messages,
+      });
+      const full = response.content[0].text.trim();
+
+      if (full.length > 600) {
+        const lines = full.split('\n');
+        const summary = lines.slice(0, 6).join('\n') + '\n\n_(Full report sent to your email)_';
+        reply = summary;
+        await sendEmail(`James: ${text.slice(0, 60)}`, full);
+      } else {
+        reply = full;
+      }
+    } else {
+      reply = await callQwen([{ role: 'system', content: JAMES_SYSTEM }, ...messages]);
+    }
+  } catch (e) {
+    console.error(`[${person.name}] AI error: ${e.message}`);
+    reply = "Sorry, I couldn't process that right now. Try again?";
+  }
+
+  await saveConversation(person.id, 'assistant', reply);
+  await send(client, person.whatsapp_number, reply);
+  console.log(`[${person.name}] general_ai (${useModel}) → ${reply.slice(0, 60)}`);
+}
+
 // ── Claude brain: classify inbound intent ────────────────────────────────────
 // Uses prompt caching on the system prompt to keep costs low.
 
@@ -368,7 +483,7 @@ Intents:
 - assign_todo: The message starts with a family member's name followed by a colon, e.g. "Max: clean room"
 - complete_todos: The message is purely numbers, e.g. "1", "1 3 5", "done 2" — marking todos as completed
 - diary: The message is about scheduling something at a specific time or date (appointments, events, meetings)
-- unknown: Anything else (greetings, questions, gibberish)
+- general_ai: Questions, research requests, recommendations, general conversation — anything not covered above (e.g. "find a restaurant", "research hotels in Japan", "what should I cook tonight")
 
 Family members: Astrid (mum), Niko (dad), Max (15), Alex (13), Vicky (11).
 
@@ -384,7 +499,7 @@ Respond with ONLY a JSON object, no explanation:
 {"intent": "assign_todo", "target": "Max", "task": "clean your room"}
 {"intent": "complete_todos", "numbers": [1, 3]}
 {"intent": "diary", "request": "the original request text"}
-{"intent": "unknown"}`;
+{"intent": "general_ai"}`;
 
 async function classifyMessage(person, text) {
   // Fast path: pure numbers — no API call needed
@@ -429,8 +544,8 @@ async function classifyMessage(person, text) {
     const raw = response.content[0].text.trim();
     return JSON.parse(raw);
   } catch (e) {
-    console.error(`Claude classification failed: ${e.message} — defaulting to add_todo`);
-    return { intent: 'add_todo', task: text };
+    console.error(`Claude classification failed: ${e.message} — defaulting to general_ai`);
+    return { intent: 'general_ai' };
   }
 }
 
@@ -768,8 +883,9 @@ async function handleInbound(client, message) {
       await addSelfTodo(client, person, classified.task || text);
       break;
 
+    case 'general_ai':
     default:
-      await addSelfTodo(client, person, text);
+      await handleGeneralAI(client, person, text);
       break;
   }
 }
