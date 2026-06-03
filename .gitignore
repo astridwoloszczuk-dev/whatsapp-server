@@ -4,3 +4,6 @@ node_modules/
 .wwebjs_cache/
 google-credentials.json
 google-token.json
+auth_baileys/
+chrome/
+node_modules/
